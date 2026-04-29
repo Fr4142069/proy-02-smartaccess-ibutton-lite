@@ -1,6 +1,6 @@
 ﻿/**
  * @file main.cpp
- * @brief SmartAccess iButton Lite v6.6 - Fleet Edition (OTA + Maint)
+ * @brief SmartAccess iButton Lite v6.6 - Audit Edition (NTP + Timestamps)
  */
 
 #include <Arduino.h>
@@ -10,6 +10,7 @@
 #include <Preferences.h>
 #include <esp_task_wdt.h>
 #include <ArduinoOTA.h>
+#include <time.h>
 #include "Hardware_Map_Lite_Vnzla.h"
 #include "secrets.h"
 
@@ -17,7 +18,11 @@
 const char* node_id = "01";
 const char* topic_control = "smartaccess/nodos/01/control";
 const char* topic_events = "smartaccess/nodos/01/eventos";
-#define WDT_TIMEOUT 10 // Aumentado ligeramente para OTA
+const char* ntpServer = "pool.ntp.org";
+const long  gmtOffset_sec = -14400; // VZLA (UTC-4)
+const int   daylightOffset_sec = 0;
+
+#define WDT_TIMEOUT 10 
 
 // --- OBJETOS ---
 WiFiClient espClient;
@@ -52,68 +57,57 @@ bool lastTamperState = HIGH;
 enum SystemState { CONNECTING, READY, GRANTED, DENIED, ALARM, UPDATING };
 SystemState currentState = CONNECTING;
 
-// --- GESTIÓN OTA (Over-The-Air) ---
+// --- GESTIÓN DE TIEMPO (NTP) ---
 
-void setupOTA() {
-    ArduinoOTA.setHostname("SmartAccess-Node-01");
-    ArduinoOTA.setPassword("admin-smart-lite"); // Seguridad para updates
-
-    ArduinoOTA.onStart([]() {
-        currentState = UPDATING;
-        String type = (ArduinoOTA.getCommand() == U_FLASH) ? "sketch" : "filesystem";
-        Serial.println("Iniciando actualización OTA: " + type);
-    });
-    
-    ArduinoOTA.onEnd([]() { Serial.println("\nActualización completada."); });
-    ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
-        Serial.printf("Progreso: %u%%\r", (progress / (total / 100)));
-    });
-    ArduinoOTA.onError([](ota_error_t error) {
-        Serial.printf("Error [%u]: ", error);
-        currentState = READY;
-    });
-    
-    ArduinoOTA.begin();
+String getTimestamp() {
+    struct tm timeinfo;
+    if (!getLocalTime(&timeinfo)) return "NO_TIME";
+    char timeStringBuff[25];
+    strftime(timeStringBuff, sizeof(timeStringBuff), "%Y-%m-%d %H:%M:%S", &timeinfo);
+    return String(timeStringBuff);
 }
 
-// --- UTILIDADES DE SISTEMA ---
-
-String getUptime() {
-    unsigned long sec = millis() / 1000;
-    unsigned long min = sec / 60;
-    char buffer[32];
-    sprintf(buffer, "%d d, %02d:%02d:%02d", (int)(sec/86400), (int)((sec%86400)/3600), (int)(min % 60), (int)(sec % 60));
-    return String(buffer);
+void setupNTP() {
+    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
 }
+
+// --- GESTIÓN DE LOGS Y EVENTOS ---
 
 void notifyEvent(String event) {
-    if (client.connected()) client.publish(topic_events, event.c_str());
-    else {
+    String timestampedEvent = "[" + getTimestamp() + "] " + event;
+    if (client.connected()) {
+        client.publish(topic_events, timestampedEvent.c_str());
+    } else {
         logStore.begin("offline_logs", false);
         int count = logStore.getInt("count", 0);
-        logStore.putString(("l" + String(count)).c_str(), event);
+        logStore.putString(("l" + String(count)).c_str(), timestampedEvent);
         logStore.putInt("count", count + 1);
         logStore.end();
+        Serial.println("Offline Log: " + timestampedEvent);
     }
 }
 
-// --- GESTIÓN DE COMANDOS ---
+void syncLogs() {
+    if (!client.connected() || (millis() - lastLogSync < logSyncInterval)) return;
+    lastLogSync = millis();
+    logStore.begin("offline_logs", false);
+    int count = logStore.getInt("count", 0);
+    if (count > 0) {
+        for (int i = 0; i < count; i++) {
+            String log = logStore.getString(("l" + String(i)).c_str(), "");
+            if (log != "") client.publish(topic_events, (String("SYNCED:") + log).c_str());
+        }
+        logStore.clear(); logStore.putInt("count", 0);
+    }
+    logStore.end();
+}
+
+// --- COMANDOS Y MANTENIMIENTO ---
 
 void handleCommands(String msg) {
-    if (msg == "REBOOT") {
-        notifyEvent("SYS:REBOOTING_REMOTE");
-        delay(1000); ESP.restart();
-    }
-    else if (msg == "CLEAR_ACL") {
-        preferences.begin("acl", false);
-        preferences.clear();
-        preferences.end();
-        notifyEvent("SYS:ACL_CLEARED");
-    }
-    else if (msg == "GET_INFO") {
-        String info = "INFO:UPTIME=" + getUptime() + "|IP=" + WiFi.localIP().toString();
-        notifyEvent(info);
-    }
+    if (msg == "GET_TIME") notifyEvent("CURRENT_TIME=" + getTimestamp());
+    else if (msg == "REBOOT") { notifyEvent("SYS:REBOOT"); delay(1000); ESP.restart(); }
+    else if (msg == "CLEAR_ACL") { preferences.begin("acl", false); preferences.clear(); preferences.end(); notifyEvent("SYS:ACL_CLEARED"); }
     else if (msg.startsWith("ADD:") || msg.startsWith("DEL:")) {
         int sep = msg.indexOf(':');
         String act = msg.substring(0, sep);
@@ -128,98 +122,95 @@ void handleCommands(String msg) {
 }
 
 void callback(char* topic, byte* payload, unsigned int length) {
-    String message = "";
-    for (int i = 0; i < length; i++) message += (char)payload[i];
-    if (String(topic).endsWith("/control")) handleCommands(message);
+    String msg = "";
+    for (int i = 0; i < length; i++) msg += (char)payload[i];
+    if (String(topic).endsWith("/control")) handleCommands(msg);
 }
 
-// --- MONITOREO HARDWARE ---
+// --- HARDWARE ---
 
 void handleLED() {
     unsigned long now = millis();
-    static bool ledState = false;
+    static bool state = false;
     int interval = 0;
-    
-    if (currentState == UPDATING) interval = 50; // Parpadeo súper rápido
+    if (currentState == UPDATING || currentState == ALARM) interval = 50;
     else if (currentState == CONNECTING) interval = 500;
     else if (currentState == DENIED) interval = 100;
-    else if (currentState == ALARM) interval = 50;
     
     if (interval > 0 && (now - ledPatternTime > interval)) {
-        ledPatternTime = now;
-        ledState = !ledState;
-        digitalWrite(PIN_LED_STATUS, ledState);
-        if (currentState == GRANTED && (now - ledPatternTime > 1000)) currentState = READY;
+        ledPatternTime = now; state = !state; digitalWrite(PIN_LED_STATUS, state);
     }
     if (currentState == GRANTED) digitalWrite(PIN_LED_STATUS, HIGH);
+    else if (currentState == READY) digitalWrite(PIN_LED_STATUS, LOW);
 }
+
+void handleIButton() {
+    if (millis() - lastIButtonCheck > ibuttonInterval) {
+        lastIButtonCheck = millis();
+        byte addr[8];
+        if (ds.search(addr)) {
+            if (OneWire::crc8(addr, 7) == addr[7]) {
+                char keyStr[17];
+                sprintf(keyStr, "%02X%02X%02X%02X%02X%02X%02X%02X", addr[0], addr[1], addr[2], addr[3], addr[4], addr[5], addr[6], addr[7]);
+                preferences.begin("acl", true);
+                bool auth = preferences.isKey(keyStr);
+                preferences.end();
+                ledPatternTime = millis();
+                if (auth) {
+                    currentState = GRANTED;
+                    digitalWrite(PIN_RELE_1, RELAY_ON); digitalWrite(PIN_RELE_2, RELAY_ON);
+                    relay1StartTime = millis(); relay2StartTime = millis();
+                    relay1Active = true; relay2Active = true;
+                    notifyEvent("ACCESS_GRANTED:" + String(keyStr));
+                } else {
+                    currentState = DENIED;
+                    notifyEvent("ACCESS_DENIED:" + String(keyStr));
+                }
+            }
+            ds.reset_search();
+        }
+    }
+}
+
+// --- SETUP / LOOP ---
 
 void setup() {
     Serial.begin(115200);
-    esp_task_wdt_init(WDT_TIMEOUT, true);
-    esp_task_wdt_add(NULL);
+    esp_task_wdt_init(WDT_TIMEOUT, true); esp_task_wdt_add(NULL);
     pinMode(PIN_RELE_1, OUTPUT); pinMode(PIN_RELE_2, OUTPUT);
     pinMode(PIN_LED_STATUS, OUTPUT); pinMode(PIN_SENSOR_DOOR, INPUT_PULLUP);
     pinMode(PIN_TAMPER_SW, INPUT_PULLUP);
     digitalWrite(PIN_RELE_1, RELAY_OFF); digitalWrite(PIN_RELE_2, RELAY_OFF);
     
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-    setupOTA();
-    client.setServer(MQTT_SERVER, 1883);
-    client.setCallback(callback);
+    setupNTP();
+    ArduinoOTA.begin();
+    client.setServer(MQTT_SERVER, 1883); client.setCallback(callback);
 }
 
 void loop() {
     esp_task_wdt_reset();
     ArduinoOTA.handle();
-    
     if (WiFi.status() == WL_CONNECTED) {
         if (!client.connected() && (millis() - lastMqttRetry > 5000)) {
             lastMqttRetry = millis();
             if (client.connect("SmartAccess_Node_Lite_01", MQTT_USER, MQTT_PASS)) {
                 client.subscribe(topic_control);
-                notifyEvent("NODE_ONLINE:UPTIME=" + getUptime());
+                notifyEvent("NODE_ONLINE");
                 currentState = READY;
             }
         }
         client.loop();
         if (client.connected() && (millis() - lastHeartbeat > heartbeatInterval)) {
             lastHeartbeat = millis();
-            client.publish(topic_events, ("HEARTBEAT:UPTIME=" + getUptime()).c_str());
+            client.publish(topic_events, ("HEARTBEAT:TIME=" + getTimestamp()).c_str());
         }
+        syncLogs();
     }
-    
-    if (currentState != UPDATING) {
-        // Ejecutar lógica solo si no estamos actualizando
-        if (millis() - lastIButtonCheck > ibuttonInterval) {
-            lastIButtonCheck = millis();
-            byte addr[8];
-            if (ds.search(addr)) {
-                if (OneWire::crc8(addr, 7) == addr[7]) {
-                    char keyStr[17];
-                    sprintf(keyStr, "%02X%02X%02X%02X%02X%02X%02X%02X", addr[0], addr[1], addr[2], addr[3], addr[4], addr[5], addr[6], addr[7]);
-                    preferences.begin("acl", true);
-                    bool auth = preferences.isKey(keyStr);
-                    preferences.end();
-                    if (auth) {
-                        currentState = GRANTED; ledPatternTime = millis();
-                        digitalWrite(PIN_RELE_1, RELAY_ON); digitalWrite(PIN_RELE_2, RELAY_ON);
-                        relay1StartTime = millis(); relay2StartTime = millis();
-                        relay1Active = true; relay2Active = true;
-                        notifyEvent("ACCESS_GRANTED:" + String(keyStr));
-                    } else {
-                        currentState = DENIED; ledPatternTime = millis();
-                        notifyEvent("ACCESS_DENIED:" + String(keyStr));
-                    }
-                }
-                ds.reset_search();
-            }
-        }
-        
-        // Gestión de Relés No Bloqueante
-        unsigned long now = millis();
-        if (relay1Active && (now - relay1StartTime > relay1Pulse)) { digitalWrite(PIN_RELE_1, RELAY_OFF); relay1Active = false; }
-        if (relay2Active && (now - relay2StartTime > relay2Pulse)) { digitalWrite(PIN_RELE_2, RELAY_OFF); relay2Active = false; }
-    }
+    handleIButton();
     handleLED();
+    
+    // Gestión relés (No bloqueante)
+    if (relay1Active && (millis() - relay1StartTime > relay1Pulse)) { digitalWrite(PIN_RELE_1, RELAY_OFF); relay1Active = false; }
+    if (relay2Active && (millis() - relay2StartTime > relay2Pulse)) { digitalWrite(PIN_RELE_2, RELAY_OFF); relay2Active = false; }
 }
