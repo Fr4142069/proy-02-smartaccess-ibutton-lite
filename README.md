@@ -36,3 +36,9 @@
 
 ---
 **SmartAccess PRO Security | v14.9.11**
+
+## 12. Pruebas y Simulación
+Para probar la lógica del nodo sin hardware físico:
+1. Instala las dependencias: `pip install paho-mqtt`
+2. Ejecuta el simulador: `python tools/mqtt_simulator.py`
+3. Usa el simulador para enviar comandos `ADD` o `DEL` y observa la respuesta `SYNC_OK` del nodo.
