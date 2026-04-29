@@ -1,0 +1,12 @@
+﻿.pio
+.vscode
+build/
+bin/
+*.exe
+*.o
+*.a
+*.d
+*.so
+*.pyc
+.DS_Store
+include/secrets.h
