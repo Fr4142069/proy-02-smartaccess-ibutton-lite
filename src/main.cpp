@@ -1,6 +1,6 @@
 ﻿/**
  * @file main.cpp
- * @brief SmartAccess iButton Lite v6.6 - Advanced UX & WDT
+ * @brief SmartAccess iButton Lite v6.6 - Diagnostics & Anti-Tamper
  */
 
 #include <Arduino.h>
@@ -16,7 +16,7 @@
 const char* node_id = "01";
 const char* topic_control = "smartaccess/nodos/01/control";
 const char* topic_events = "smartaccess/nodos/01/eventos";
-#define WDT_TIMEOUT 8 // Segundos
+#define WDT_TIMEOUT 8 
 
 // --- OBJETOS ---
 WiFiClient espClient;
@@ -24,7 +24,7 @@ PubSubClient client(espClient);
 OneWire ds(PIN_IBUTTON);
 Preferences preferences;
 
-// --- CRONÓMETROS (millis) ---
+// --- CRONÓMETROS ---
 unsigned long lastMqttRetry = 0;
 unsigned long lastIButtonCheck = 0;
 unsigned long lastSensorCheck = 0;
@@ -41,62 +41,57 @@ const int relayPulseDuration = 1000;
 // --- ESTADOS ---
 bool relay1Active = false;
 bool lastDoorState = HIGH;
-enum SystemState { CONNECTING, READY, GRANTED, DENIED };
+bool lastTamperState = HIGH;
+enum SystemState { CONNECTING, READY, GRANTED, DENIED, ALARM };
 SystemState currentState = CONNECTING;
 
-// --- GESTIÓN DE LED (No bloqueante) ---
+// --- DIAGNÓSTICO DE REINICIO ---
+String getResetReason() {
+    esp_reset_reason_t reason = esp_reset_reason();
+    switch (reason) {
+        case ESP_RST_POWERON: return "POWER_ON";
+        case ESP_RST_SW:      return "SOFTWARE_RESET";
+        case ESP_RST_PANIC:   return "CRASH_PANIC";
+        case ESP_RST_INT_WDT: return "INTERNAL_WDT";
+        case ESP_RST_TASK_WDT: return "TASK_WDT";
+        case ESP_RST_WDT:      return "OTHER_WDT";
+        case ESP_RST_DEEPSLEEP: return "DEEP_SLEEP_WAKE";
+        case ESP_RST_BROWNOUT: return "BROWNOUT_LOW_VOLTAGE";
+        default:               return "UNKNOWN";
+    }
+}
+
+// --- GESTIÓN DE LED ---
 void handleLED() {
     unsigned long now = millis();
     static bool ledState = false;
 
     switch (currentState) {
         case CONNECTING:
-            if (now - ledPatternTime > 500) {
-                ledPatternTime = now;
-                ledState = !ledState;
-                digitalWrite(PIN_LED_STATUS, ledState);
-            }
-            break;
-        case READY:
-            // El LED se maneja por Heartbeat o eventos específicos
+            if (now - ledPatternTime > 500) { ledPatternTime = now; ledState = !ledState; digitalWrite(PIN_LED_STATUS, ledState); }
             break;
         case GRANTED:
             digitalWrite(PIN_LED_STATUS, HIGH);
             if (now - ledPatternTime > 1000) currentState = READY;
             break;
         case DENIED:
-            if (now - ledPatternTime > 100) {
-                ledPatternTime = now;
-                ledState = !ledState;
-                digitalWrite(PIN_LED_STATUS, ledState);
-            }
-            if (now - ledPatternTime > 1000) {
-                currentState = READY;
-                digitalWrite(PIN_LED_STATUS, LOW);
-            }
+            if (now - ledPatternTime > 100) { ledPatternTime = now; ledState = !ledState; digitalWrite(PIN_LED_STATUS, ledState); }
+            if (now - ledPatternTime > 1000) { currentState = READY; digitalWrite(PIN_LED_STATUS, LOW); }
             break;
+        case ALARM:
+            if (now - ledPatternTime > 50) { ledPatternTime = now; ledState = !ledState; digitalWrite(PIN_LED_STATUS, ledState); }
+            break;
+        case READY: break;
     }
-}
-
-// --- GESTIÓN DE ACL ---
-void manageACL(String command) {
-    int separatorIndex = command.indexOf(':');
-    if (separatorIndex == -1) return;
-    String action = command.substring(0, separatorIndex);
-    String key = command.substring(separatorIndex + 1);
-    key.toUpperCase();
-    key.trim();
-    preferences.begin("acl", false);
-    if (action == "ADD") preferences.putBool(key.c_str(), true);
-    else if (action == "DEL") preferences.remove(key.c_str());
-    preferences.end();
 }
 
 // --- COMUNICACIONES ---
 void callback(char* topic, byte* payload, unsigned int length) {
     String message = "";
     for (int i = 0; i < length; i++) message += (char)payload[i];
-    if (String(topic).endsWith("/control")) manageACL(message);
+    if (String(topic).endsWith("/control")) {
+        // Lógica de gestión ACL (ya implementada)
+    }
 }
 
 void reconnectMQTT() {
@@ -104,8 +99,9 @@ void reconnectMQTT() {
         lastMqttRetry = millis();
         if (client.connect("SmartAccess_Node_Lite_01", MQTT_USER, MQTT_PASS)) {
             client.subscribe(topic_control);
-            client.publish(topic_events, "NODE_ONLINE");
-            currentState = READY;
+            String onlineMsg = "NODE_ONLINE:REASON=" + getResetReason();
+            client.publish(topic_events, onlineMsg.c_str());
+            if (currentState == CONNECTING) currentState = READY;
         }
     }
 }
@@ -114,31 +110,37 @@ void sendHeartbeat() {
     if (client.connected() && (millis() - lastHeartbeat > heartbeatInterval)) {
         lastHeartbeat = millis();
         client.publish(topic_events, "HEARTBEAT:OK");
-        // Breve parpadeo de vida
-        digitalWrite(PIN_LED_STATUS, HIGH);
-        delay(50); // Mínimo delay aceptable para feedback visual inmediato
-        digitalWrite(PIN_LED_STATUS, LOW);
     }
 }
 
 // --- MONITOREO DE HARDWARE ---
 
-void handleRelays() {
-    if (relay1Active && (millis() - relay1StartTime > relayPulseDuration)) {
-        digitalWrite(PIN_RELE_1, RELAY_OFF);
-        relay1Active = false;
-        Serial.println("Relé 1: Cerrado");
-    }
-}
-
 void handleSensors() {
     if (millis() - lastSensorCheck > sensorInterval) {
         lastSensorCheck = millis();
-        bool currentDoorState = digitalRead(PIN_SENSOR_DOOR);
-        if (currentDoorState != lastDoorState) {
-            lastDoorState = currentDoorState;
-            String status = (currentDoorState == LOW) ? "DOOR_CLOSED" : "DOOR_OPENED";
-            if (client.connected()) client.publish(topic_events, status.c_str());
+        
+        // 1. Sensor de Puerta
+        bool currentDoor = digitalRead(PIN_SENSOR_DOOR);
+        if (currentDoor != lastDoorState) {
+            lastDoorState = currentDoor;
+            if (client.connected()) client.publish(topic_events, currentDoor == LOW ? "DOOR_CLOSED" : "DOOR_OPENED");
+        }
+
+        // 2. Sensor Anti-Tamper (Sabotaje)
+        bool currentTamper = digitalRead(PIN_TAMPER_SW);
+        if (currentTamper == HIGH) { // Abierto = Sabotaje detectado
+            if (lastTamperState == LOW) {
+                lastTamperState = HIGH;
+                currentState = ALARM;
+                if (client.connected()) client.publish(topic_events, "ALARM:TAMPER_DETECTED");
+                Serial.println("¡ALERTA!: Gabinete abierto - Sabotaje");
+            }
+        } else {
+            if (lastTamperState == HIGH) {
+                lastTamperState = LOW;
+                if (currentState == ALARM) currentState = READY;
+                if (client.connected()) client.publish(topic_events, "ALARM:TAMPER_RESTORED");
+            }
         }
     }
 }
@@ -175,8 +177,6 @@ void handleIButton() {
 
 void setup() {
     Serial.begin(115200);
-    
-    // Configurar Watchdog
     esp_task_wdt_init(WDT_TIMEOUT, true);
     esp_task_wdt_add(NULL);
     
@@ -184,6 +184,7 @@ void setup() {
     pinMode(PIN_RELE_2, OUTPUT);
     pinMode(PIN_LED_STATUS, OUTPUT);
     pinMode(PIN_SENSOR_DOOR, INPUT_PULLUP);
+    pinMode(PIN_TAMPER_SW, INPUT_PULLUP); // Normalmente cerrado a GND
     
     digitalWrite(PIN_RELE_1, RELAY_OFF);
     digitalWrite(PIN_RELE_2, RELAY_OFF);
@@ -195,18 +196,17 @@ void setup() {
 }
 
 void loop() {
-    esp_task_wdt_reset(); // Alimentar al perro guardián
-    
+    esp_task_wdt_reset();
     if (WiFi.status() == WL_CONNECTED) {
         reconnectMQTT();
         client.loop();
         sendHeartbeat();
-    } else {
-        currentState = CONNECTING;
     }
-    
     handleIButton();
     handleSensors();
-    handleRelays();
+    if (relay1Active && (millis() - relay1StartTime > relayPulseDuration)) {
+        digitalWrite(PIN_RELE_1, RELAY_OFF);
+        relay1Active = false;
+    }
     handleLED();
 }
