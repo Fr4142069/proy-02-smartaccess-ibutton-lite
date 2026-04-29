@@ -1,6 +1,6 @@
 ﻿/**
  * @file main.cpp
- * @brief Código Base SmartAccess iButton Lite v6.6 - Hito 3.1: Security & Sensors
+ * @brief SmartAccess iButton Lite v6.6 - 100% Non-Blocking & Heartbeat
  */
 
 #include <Arduino.h>
@@ -11,18 +11,32 @@
 #include "Hardware_Map_Lite_Vnzla.h"
 #include "secrets.h"
 
+// --- CONFIGURACIÓN ---
+const char* node_id = "01";
+const char* topic_control = "smartaccess/nodos/01/control";
+const char* topic_events = "smartaccess/nodos/01/eventos";
+
 // --- OBJETOS ---
 WiFiClient espClient;
 PubSubClient client(espClient);
 OneWire ds(PIN_IBUTTON);
 Preferences preferences;
 
-// --- VARIABLES GLOBALES ---
+// --- CRONÓMETROS (millis) ---
 unsigned long lastMqttRetry = 0;
 unsigned long lastIButtonCheck = 0;
 unsigned long lastSensorCheck = 0;
+unsigned long lastHeartbeat = 0;
+unsigned long relay1StartTime = 0;
+
+// --- CONFIGURACIÓN DE TIEMPOS ---
 const int ibuttonInterval = 150; 
 const int sensorInterval = 1000;
+const int heartbeatInterval = 30000; // 30s
+const int relayPulseDuration = 1000;  // 1s
+
+// --- ESTADOS ---
+bool relay1Active = false;
 bool lastDoorState = HIGH;
 
 // --- GESTIÓN DE ACL ---
@@ -50,13 +64,30 @@ void reconnectMQTT() {
     if (!client.connected() && (millis() - lastMqttRetry > 5000)) {
         lastMqttRetry = millis();
         if (client.connect("SmartAccess_Node_Lite_01", MQTT_USER, MQTT_PASS)) {
-            client.subscribe("smartaccess/nodos/01/control");
-            client.publish("smartaccess/nodos/01/eventos", "NODE_ONLINE");
+            client.subscribe(topic_control);
+            client.publish(topic_events, "NODE_ONLINE");
         }
     }
 }
 
-// --- MONITOREO DE SENSORES ---
+void sendHeartbeat() {
+    if (client.connected() && (millis() - lastHeartbeat > heartbeatInterval)) {
+        lastHeartbeat = millis();
+        client.publish(topic_events, "HEARTBEAT:OK");
+    }
+}
+
+// --- MONITOREO DE HARDWARE ---
+
+void handleRelays() {
+    if (relay1Active && (millis() - relay1StartTime > relayPulseDuration)) {
+        digitalWrite(PIN_RELE_1, RELAY_OFF);
+        digitalWrite(PIN_LED_STATUS, LOW);
+        relay1Active = false;
+        Serial.println("Relé 1: Cerrado (Fin de pulso)");
+    }
+}
+
 void handleSensors() {
     if (millis() - lastSensorCheck > sensorInterval) {
         lastSensorCheck = millis();
@@ -64,15 +95,12 @@ void handleSensors() {
         if (currentDoorState != lastDoorState) {
             lastDoorState = currentDoorState;
             String status = (currentDoorState == LOW) ? "DOOR_CLOSED" : "DOOR_OPENED";
-            if (client.connected()) {
-                client.publish("smartaccess/nodos/01/eventos", status.c_str());
-            }
+            if (client.connected()) client.publish(topic_events, status.c_str());
             Serial.println("Sensor: " + status);
         }
     }
 }
 
-// --- CONTROL DE ACCESO ---
 void handleIButton() {
     if (millis() - lastIButtonCheck > ibuttonInterval) {
         lastIButtonCheck = millis();
@@ -81,19 +109,21 @@ void handleIButton() {
             if (OneWire::crc8(addr, 7) == addr[7]) {
                 char keyStr[17];
                 sprintf(keyStr, "%02X%02X%02X%02X%02X%02X%02X%02X", addr[0], addr[1], addr[2], addr[3], addr[4], addr[5], addr[6], addr[7]);
+                
                 preferences.begin("acl", true);
                 bool auth = preferences.isKey(keyStr);
                 preferences.end();
                 
                 if (auth) {
+                    Serial.printf("Acceso Concedido: %s\n", keyStr);
                     digitalWrite(PIN_RELE_1, RELAY_ON);
                     digitalWrite(PIN_LED_STATUS, HIGH);
-                    if (client.connected()) client.publish("smartaccess/nodos/01/eventos", (String("ACCESS_GRANTED:") + keyStr).c_str());
-                    delay(500); // Apertura
-                    digitalWrite(PIN_RELE_1, RELAY_OFF);
-                    digitalWrite(PIN_LED_STATUS, LOW);
+                    relay1StartTime = millis();
+                    relay1Active = true;
+                    if (client.connected()) client.publish(topic_events, (String("ACCESS_GRANTED:") + keyStr).c_str());
                 } else {
-                    if (client.connected()) client.publish("smartaccess/nodos/01/eventos", (String("ACCESS_DENIED:") + keyStr).c_str());
+                    Serial.printf("Acceso Denegado: %s\n", keyStr);
+                    if (client.connected()) client.publish(topic_events, (String("ACCESS_DENIED:") + keyStr).c_str());
                 }
             }
             ds.reset_search();
@@ -107,8 +137,11 @@ void setup() {
     pinMode(PIN_RELE_2, OUTPUT);
     pinMode(PIN_LED_STATUS, OUTPUT);
     pinMode(PIN_SENSOR_DOOR, INPUT_PULLUP);
+    
     digitalWrite(PIN_RELE_1, RELAY_OFF);
     digitalWrite(PIN_RELE_2, RELAY_OFF);
+    digitalWrite(PIN_LED_STATUS, LOW);
+    
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
     client.setServer(MQTT_SERVER, 1883);
     client.setCallback(callback);
@@ -118,7 +151,9 @@ void loop() {
     if (WiFi.status() == WL_CONNECTED) {
         reconnectMQTT();
         client.loop();
+        sendHeartbeat();
     }
     handleIButton();
     handleSensors();
+    handleRelays(); // Gestión no bloqueante del pulso del relé
 }
