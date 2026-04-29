@@ -6,7 +6,7 @@
 *   **Lead Engineer:** Francisco
 *   **Arquitectura:** Edge Node (ESP32)
 *   **Estado:** Inicialización
-*   **Repositorio GitHub:** [Pendiente]
+*   **Repositorio GitHub:** https://github.com/Fr4142069/proy-02-smartaccess-ibutton-lite
 
 ## 1. Identidad del Proyecto
 *   **Nombre Oficial:** SmartAccess iButton Lite v6.6
@@ -32,7 +32,7 @@
 ## 7. Hoja de Roadmap
 *   **Hito 1:** Inicialización de arquitectura híbrida. -> **[COMPLETADO]**
 *   **Hito 2:** Implementación de código base no bloqueante. -> **[EN PROCESO]**
-*   **Hito 3:** Sincronización SQL vía MQTT. -> **[PENDIENTE]**
+*   **Hito 3:** Sincronización SQL vía MQTT. -> **https://github.com/Fr4142069/proy-02-smartaccess-ibutton-lite**
 
 ---
 **SmartAccess PRO Security | v14.9.11**
