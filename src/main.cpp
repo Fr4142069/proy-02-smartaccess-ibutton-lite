@@ -1,6 +1,8 @@
 ﻿/**
  * @file main.cpp
- * @brief SmartAccess iButton Lite v7.0.1 - Master Edition (Full Log Sync)
+ * @brief SmartAccess iButton Lite v7.1.0 - PROFESSIONAL MASTER EDITION
+ * 
+ * Ecosistema completo de control de acceso industrial.
  */
 
 #include <Arduino.h>
@@ -15,7 +17,7 @@
 #include <time.h>
 #include "Hardware_Map_Lite_Vnzla.h"
 
-// --- OBJETOS ---
+// --- OBJETOS Y CONFIGURACIÓN ---
 WebServer server(80);
 WiFiClient espClient;
 PubSubClient mqttClient(espClient);
@@ -27,8 +29,9 @@ Preferences logPrefs;
 char node_id[32], mqtt_server[64], wifi_ssid[32], wifi_pass[64];
 const char* topic_control = "smartaccess/nodos/control";
 const char* topic_events = "smartaccess/nodos/eventos";
+const char* ntp_server = "pool.ntp.org";
 
-// --- CRONÓMETROS ---
+// --- CRONÓMETROS Y ESTADOS ---
 unsigned long lastHeartbeat = 0, lastIButton = 0, lastSensor = 0, lastLogSync = 0;
 unsigned long relay1Start = 0, relay2Start = 0, ledPatternTime = 0, mqttRetryTime = 0;
 bool relay1Active = false, relay2Active = false, lastDoor = HIGH, lastTamper = HIGH;
@@ -36,7 +39,27 @@ bool relay1Active = false, relay2Active = false, lastDoor = HIGH, lastTamper = H
 enum SystemMode { CONFIG_MODE, RUN_MODE } currentMode = CONFIG_MODE;
 enum UIState { UI_CONNECTING, UI_READY, UI_GRANTED, UI_DENIED, UI_ALARM, UI_OTA } currentUI = UI_CONNECTING;
 
-// --- TELEMETRÍA ---
+// --- PORTAL WEB (HTML/CSS) ---
+const char* HTML_BODY = R"rawliteral(
+<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SmartAccess v7.1</title><style>
+body { font-family: 'Segoe UI', sans-serif; background: #1a1a1a; color: #fff; text-align: center; }
+.card { background: #2d2d2d; padding: 30px; border-radius: 15px; display: inline-block; margin-top: 50px; box-shadow: 0 10px 20px rgba(0,0,0,0.5); width: 90%; max-width: 400px; }
+h2 { color: #00d2ff; }
+input { display: block; width: 100%; margin: 15px 0; padding: 12px; border-radius: 5px; border: 1px solid #444; background: #3d3d3d; color: #fff; box-sizing: border-box; }
+button { background: linear-gradient(135deg, #00d2ff 0%, #3a7bd5 100%); color: white; border: none; padding: 12px; width: 100%; border-radius: 5px; cursor: pointer; font-weight: bold; }
+p { font-size: 0.8em; color: #888; }
+</style></head><body><div class="card"><h2>SmartAccess v7.1</h2><p>Nodo de Borde Industrial</p>
+<form action="/save" method="POST">
+<input name="s" placeholder="WiFi SSID (Red)">
+<input name="p" type="password" placeholder="WiFi Password">
+<input name="m" placeholder="MQTT Broker IP/DNS">
+<input name="i" placeholder="Node ID (ej. 01)">
+<button type="submit">GUARDAR Y REINICIAR</button>
+</form></div></body></html>
+)rawliteral";
+
+// --- UTILIDADES ---
 
 String getTS() {
     struct tm ti; if (!getLocalTime(&ti)) return "0000-00-00 00:00:00";
@@ -44,14 +67,14 @@ String getTS() {
 }
 
 void notify(String type, String msg, String data = "") {
-    StaticJsonDocument<384> doc;
+    StaticJsonDocument<512> doc;
     doc["node"] = node_id; doc["type"] = type; doc["msg"] = msg;
     if (data != "") doc["data"] = data;
     doc["ts"] = getTS();
     doc["heap"] = ESP.getFreeHeap();
     doc["rssi"] = WiFi.RSSI();
     
-    char b[384]; serializeJson(doc, b);
+    char b[512]; serializeJson(doc, b);
     if (mqttClient.connected()) mqttClient.publish(topic_events, b);
     else {
         logPrefs.begin("logs", false);
@@ -63,54 +86,56 @@ void notify(String type, String msg, String data = "") {
 }
 
 void syncLogs() {
-    if (!mqttClient.connected()) return;
-    if (millis() - lastLogSync < 5000) return;
+    if (!mqttClient.connected() || (millis() - lastLogSync < 5000)) return;
     lastLogSync = millis();
-
     logPrefs.begin("logs", false);
     int count = logPrefs.getInt("c", 0);
     if (count > 0) {
-        Serial.printf("[SYNC] Enviando %d logs pendientes...\n", count);
         for (int i = 0; i < count; i++) {
-            String key = "l" + String(i);
-            String logMsg = logPrefs.getString(key.c_str(), "");
+            String logMsg = logPrefs.getString(("l"+String(i)).c_str(), "");
             if (logMsg != "") {
-                // Añadir prefijo para identificar que es un log offline sincronizado
-                StaticJsonDocument<512> doc;
-                deserializeJson(doc, logMsg);
+                StaticJsonDocument<512> doc; deserializeJson(doc, logMsg);
                 doc["sync"] = true;
-                char buffer[512];
-                serializeJson(doc, buffer);
+                char buffer[512]; serializeJson(doc, buffer);
                 mqttClient.publish(topic_events, buffer);
             }
         }
-        logPrefs.clear(); 
-        logPrefs.putInt("c", 0);
-        Serial.println("[SYNC] Memoria Flash liberada.");
+        logPrefs.clear(); logPrefs.putInt("c", 0);
     }
     logPrefs.end();
 }
 
-// --- COMANDOS ---
+// --- COMANDOS Y SERVIDOR ---
+
+void handleSave() {
+    configPrefs.begin("cfg", false);
+    configPrefs.putString("s", server.arg("s"));
+    configPrefs.putString("p", server.arg("p"));
+    configPrefs.putString("m", server.arg("m"));
+    configPrefs.putString("i", server.arg("i"));
+    configPrefs.end();
+    server.send(200, "text/plain", "OK. Reiniciando...");
+    delay(2000); ESP.restart();
+}
 
 void handleCommands(String json) {
     StaticJsonDocument<256> doc; if (deserializeJson(doc, json)) return;
     if (doc["id"] != node_id && doc["id"] != "ALL") return;
-    
     String cmd = doc["cmd"] | "";
     if (cmd == "REBOOT") ESP.restart();
-    else if (cmd == "CLEAR_ACL") { aclPrefs.begin("acl", false); aclPrefs.clear(); aclPrefs.end(); notify("SYS", "ACL_CLEARED"); }
-    else if (cmd == "ADD") {
-        aclPrefs.begin("acl", false); aclPrefs.putBool(doc["key"], true); aclPrefs.end();
-        notify("ACL", "ADDED", doc["key"]);
-    }
-    else if (cmd == "DEL") {
-        aclPrefs.begin("acl", false); aclPrefs.remove(doc["key"]); aclPrefs.end();
-        notify("ACL", "REMOVED", doc["key"]);
-    }
+    else if (cmd == "ADD") { aclPrefs.begin("acl", false); aclPrefs.putBool(doc["key"], true); aclPrefs.end(); notify("ACL", "ADDED", doc["key"]); }
+    else if (cmd == "DEL") { aclPrefs.begin("acl", false); aclPrefs.remove(doc["key"]); aclPrefs.end(); notify("ACL", "REMOVED", doc["key"]); }
 }
 
 // --- HARDWARE ---
+
+void handleUI() {
+    unsigned long n = millis(); static bool s = false;
+    int i = (currentUI == UI_OTA || currentUI == UI_ALARM) ? 50 : (currentUI == UI_CONNECTING) ? 500 : (currentUI == UI_DENIED) ? 100 : 0;
+    if (i > 0 && (n - ledPatternTime > i)) { ledPatternTime = n; s = !s; digitalWrite(PIN_LED_STATUS, s); }
+    if (currentUI == UI_GRANTED) digitalWrite(PIN_LED_STATUS, HIGH);
+    else if (currentUI == UI_READY) digitalWrite(PIN_LED_STATUS, LOW);
+}
 
 void handleHardware() {
     unsigned long n = millis();
@@ -159,10 +184,9 @@ void setup() {
 
     if (s == "") { 
         WiFi.softAP("SmartAccess-Setup");
-        server.on("/", [](){ server.send(200, "text/html", "<html>Config Portal</html>"); }); // Simplificado para brev.
-        server.on("/save", HTTP_POST, [](){ /* handleSave */ });
-        server.begin();
-        currentMode = CONFIG_MODE; 
+        server.on("/", [](){ server.send(200, "text/html", HTML_BODY); });
+        server.on("/save", HTTP_POST, handleSave);
+        server.begin(); currentMode = CONFIG_MODE; 
     } else {
         WiFi.begin(s.c_str(), p.c_str());
         configTime(-14400, 0, ntp_server);
@@ -189,5 +213,5 @@ void loop() {
         } else { currentUI = UI_CONNECTING; }
         handleHardware();
     }
-    // handleUI() (Lógica ya implementada)
+    handleUI();
 }
